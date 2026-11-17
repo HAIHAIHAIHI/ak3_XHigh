@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # 应用 SUSFS 补丁及各内核版本所需的上下文修复
 #
@@ -1104,3 +1105,126 @@ susfs_priority_uid_filter_guard_compat() {
   echo "SUSFS priority uid filter 守卫步骤：已包裹"
 }
 susfs_priority_uid_filter_guard_compat
+###############################################################################
+# FinaSU + CONFIG_KSU_SUSFS: 修复 SELinux context oracle 的两处确定性缺陷
+#
+# 缺陷 1 —— kernel/feature/selinux_hide.c
+#   ksu_selinux_hide_enable() 在 #ifdef CONFIG_KSU_SUSFS 分支里直接 return 0，
+#   而 ksu_selinux_hide_keep_backup = true 只写在 #else 分支。SUSFS 构建下
+#   该标志永远 false -> on_boot_completed() 必然 drop backup_sepolicy。
+#
+# 缺陷 2 —— fs/susfs.c（system_data_file 报 EINVAL 的直接原因）
+#   st_susfs_sus_type_hlist 只存 hlist_node、不存 type_value，
+#   susfs_add_sus_type() 去重与 susfs_is_sus_type_rcu() 判断都只遍历
+#   hash bucket、不比较值 -> 原生合法 type 被误判为 sus type -> -EINVAL。
+#   SUSFS 的 context 查询走 live policy，与 backup_sepolicy 无关。
+#
+# 仅对 FinaSU 生效；内容探测 -> 语义替换 -> 写后校验 -> 上游已修自动跳过。
+###############################################################################
+
+finasu_selinux_keep_backup_fix() {
+  [ "${KSU_VARIANT:-}" = "FinaSU" ] || return 0
+
+  local ksu_dirs="$KERNEL_ROOT/common/drivers/kernelsu $KERNEL_ROOT/KernelSU"
+  local f
+  f=$(grep -Rls 'ksu_selinux_hide_drop_backup_if_unused' $ksu_dirs 2>/dev/null | head -n 1 || true)
+  if [ -z "$f" ]; then
+    echo "FinaSU selinux_hide: 未找到 drop 实现（上游形态可能已变），跳过"
+    return 0
+  fi
+  if ! grep -q 'ksu_selinux_hide_keep_backup' "$f"; then
+    echo "FinaSU selinux_hide: 上游已改用其它判定，跳过"
+    return 0
+  fi
+
+  if perl -0777 -ne 'exit(/#ifdef[ \t]+CONFIG_KSU_SUSFS[ \t]*\r?\n(?:(?!#else).)*?ksu_selinux_hide_keep_backup[ \t]*=[ \t]*true/s ? 0 : 1)' "$f"; then
+    echo "FinaSU selinux_hide: keep_backup 已在 SUSFS 分支赋值，跳过"
+    return 0
+  fi
+
+  echo "FinaSU selinux_hide: 在 SUSFS 分支补 keep_backup 赋值（${f#"$KERNEL_ROOT"/}）"
+  perl -0777 -i -pe '
+    my $n = s{
+        (\#ifdef[ \t]+CONFIG_KSU_SUSFS[ \t]*\r?\n)
+        ((?:[ \t]*\r?\n)*)
+        ([ \t]*return[ \t]+0;[ \t]*\r?\n)
+        (\#else)
+      }{
+        $1 . $2
+           . "    /* SUSFS selinuxfs hooks are installed at build time: the backup is live. */\n"
+           . "    ksu_selinux_hide_keep_backup = true;\n"
+           . $3 . $4
+      }ex;
+    die "SUSFS 分支匹配失败（n=" . ($n // 0) . "），需人工核对\n" unless ($n // 0) == 1;
+  ' "$f" || { echo "::error::FinaSU selinux_hide 补 keep_backup 失败" >&2; exit 1; }
+
+  local cnt
+  cnt=$(grep -c 'ksu_selinux_hide_keep_backup[[:space:]]*=[[:space:]]*true' "$f" || true)
+  if [ "$cnt" -ne 2 ]; then
+    echo "::error::keep_backup 赋值计数不符（期望 2，实际 $cnt）" >&2
+    exit 1
+  fi
+  echo "FinaSU selinux_hide: 已修补（drop 在 feature=1 时不再触发）"
+}
+
+susfs_sus_type_exact_match_fix() {
+  [ "${KSU_VARIANT:-}" = "FinaSU" ] || return 0
+
+  local f=""
+  local c
+  for c in "$KERNEL_ROOT/common/fs/susfs.c" "$KERNEL_ROOT/fs/susfs.c"; do
+    [ -f "$c" ] && { f="$c"; break; }
+  done
+  if [ -z "$f" ]; then
+    echo "::warning title=SUSFS sus_type::未找到 fs/susfs.c，跳过"
+    return 0
+  fi
+  if ! grep -q 'susfs_is_sus_type_rcu' "$f"; then
+    echo "SUSFS sus_type: 上游实现形态已变，跳过"
+    return 0
+  fi
+  if grep -q 'entry->type_value == type_value' "$f"; then
+    echo "SUSFS sus_type: 上游已做精确比较，跳过"
+    return 0
+  fi
+
+  echo "SUSFS sus_type: 为 SUS_TYPE_HLIST 增加 type_value 精确比较（${f#"$KERNEL_ROOT"/}）"
+  perl -0777 -i -pe '
+    my $n = 0;
+
+    # 1) 结构体存值
+    $n += s{
+        (struct[ \t]+st_susfs_sus_type_hlist[ \t]*\{[ \t]*\r?\n)
+        ([ \t]*)(struct[ \t]+hlist_node[ \t]+node;)
+      }{$1$2u32 type_value;\n$2$3}x;
+
+    # 2) add 去重：只与真正的重复值冲突
+    $n += s{
+        (hash_for_each_possible_safe\(SUS_TYPE_HLIST,[ \t]*tmp_entry,[ \t]*tmp_hlist_node,[ \t]*node,[ \t]*type_value\)[ \t]*\{[ \t]*\r?\n)
+        ([ \t]*)(SUSFS_LOGE)
+      }{$1$2if (tmp_entry->type_value != type_value)\n$2\tcontinue;\n$2$3}x;
+
+    # 3) add 写入值
+    $n += s{
+        (\r?\n)([ \t]*)hash_add_rcu\(SUS_TYPE_HLIST,[ \t]*&new_entry->node,[ \t]*type_value\);
+      }{$1$2new_entry->type_value = type_value;$1$2hash_add_rcu(SUS_TYPE_HLIST, &new_entry->node, type_value);}x;
+
+    # 4) 查询：精确比较，避免同 bucket 的原生 type 被误杀
+    $n += s{
+        (hash_for_each_possible_rcu\(SUS_TYPE_HLIST,[ \t]*entry,[ \t]*node,[ \t]*type_value\)[ \t]*\{[ \t]*\r?\n)
+        ([ \t]*)return[ \t]+true;
+      }{$1$2if (entry->type_value == type_value)\n$2\treturn true;}x;
+
+    die "sus_type 改写命中 $n 处（期望 4），需人工核对\n" unless $n == 4;
+  ' "$f" || { echo "::error::SUSFS sus_type 精确比较改写失败" >&2; exit 1; }
+
+  grep -q 'u32 type_value;' "$f" \
+    && grep -q 'tmp_entry->type_value != type_value' "$f" \
+    && grep -q 'new_entry->type_value = type_value' "$f" \
+    && grep -q 'entry->type_value == type_value' "$f" \
+    || { echo "::error::sus_type 写后校验失败" >&2; exit 1; }
+  echo "SUSFS sus_type: 已修补（原生 type 不再因 hash 碰撞被拒）"
+}
+
+finasu_selinux_keep_backup_fix
+susfs_sus_type_exact_match_fix
